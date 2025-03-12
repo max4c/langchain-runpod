@@ -70,25 +70,3 @@ print(response.content)
 3. Select a GPU and template (e.g., choose a template that runs vLLM, FastChat, or text-generation-webui)
 4. Configure settings and deploy
 5. Note the endpoint ID for use with this library
-
-## LLMs
-
-`RunPodLLM` class exposes LLMs from RunPod.
-
-```python
-from langchain_runpod import RunPodLLM
-
-llm = RunPodLLM(endpoint_id="endpoint-id")
-llm.invoke("The meaning of life is")
-```
-
-## Embeddings
-
-`RunPodEmbeddings` class exposes embeddings from RunPod.
-
-```python
-from langchain_runpod import RunPodEmbeddings
-
-embeddings = RunPodEmbeddings(endpoint_id="endpoint-id")
-embeddings.embed_query("What is the meaning of life?")
-```

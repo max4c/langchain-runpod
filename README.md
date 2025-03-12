@@ -14,6 +14,7 @@ Configure credentials by setting the following environment variable:
 
 ```bash
 export RUNPOD_API_KEY="your-runpod-api-key"
+
 ```
 
 You can obtain your RunPod API key from the [RunPod API Keys page](https://www.runpod.io/console/user/settings) in your account settings.
@@ -23,35 +24,24 @@ You can obtain your RunPod API key from the [RunPod API Keys page](https://www.r
 `ChatRunPod` class allows you to interact with any text-based LLM running on RunPod's serverless endpoints.
 
 ```python
+import os
+
+# Set your RunPod API key
+os.environ["RUNPOD_API_KEY"] = "your-runpod-api-key"  # Replace with your actual API key
+
 from langchain_runpod import ChatRunPod
 
-# Create the chat model instance
-# Replace "endpoint-id" with your RunPod endpoint ID
+# Initialize the ChatRunPod model
+# Replace "endpoint-id" with your actual RunPod endpoint ID
 chat = ChatRunPod(
     endpoint_id="endpoint-id",  # Your RunPod serverless endpoint ID
-    model_name="llama3-70b-chat",  # Optional - for identification purposes
-    temperature=0.7,
-    max_tokens=1024,
-    # api_key="your-runpod-api-key",  # Optional if set as environment variable
+    model_name="llama3-70b-chat",  # Optional - helps with identification
+    temperature=0.7,  # Control randomness (0.0 to 1.0)
+    max_tokens=1024,  # Maximum tokens in the response
 )
 
-# Standard invoke method
-response = chat.invoke("Tell me fun things to do in NYC")
-print(response.content)
-
-# With streaming
-for chunk in chat.stream("Tell me fun things to do in NYC"):
-    print(chunk.content, end="", flush=True)
-
-# Using multiple messages for chat
-from langchain_core.messages import HumanMessage, SystemMessage
-
-messages = [
-    SystemMessage(content="You are a helpful travel assistant."),
-    HumanMessage(content="What are the must-see attractions in Paris?")
-]
-
-response = chat.invoke(messages)
+# Basic invocation
+response = chat.invoke("Explain how transformer models work in 3 sentences.")
 print(response.content)
 ```
 

@@ -3,7 +3,9 @@
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional, Union, Iterator
+import time
+import asyncio
+from typing import Any, Dict, List, Optional, Union, Iterator, AsyncIterator
 
 import httpx
 from langchain_core.callbacks import (
@@ -17,20 +19,38 @@ from pydantic import Field, PrivateAttr, model_validator
 logger = logging.getLogger(__name__)
 
 
+class RunPodAPIError(Exception):
+    """Custom exception for RunPod API errors."""
+    pass
+
+
 class RunPod(LLM):
     """LLM model wrapper for RunPod API.
 
+    Supports both synchronous and asynchronous generation, as well as
+    (simulated) streaming.
+
     To use, you should have the ``langchain-runpod`` package installed, and the
     environment variable ``RUNPOD_API_KEY`` set with your API key, or pass it
-    as the ``api_key`` parameter.
+    as the ``api_key`` parameter using named arguments.
 
     Example:
         .. code-block:: python
 
             from langchain_runpod import RunPod
-            
-            llm = RunPod(endpoint_id="your-endpoint-id")
-            llm.invoke("Tell me a joke")
+
+            # Synchronous call
+            llm = RunPod(endpoint_id="your-endpoint-id", api_key="your-key")
+            response = llm.invoke("Tell me a joke")
+            print(response)
+
+            # Async call
+            # response = await llm.ainvoke("Tell me another joke")
+            # print(response)
+
+            # Streaming (synchronous)
+            # for chunk in llm.stream("Why did the chicken cross the road?"): 
+            #     print(chunk, end="", flush=True)
     """
     
     endpoint_id: str = Field(..., description="The RunPod endpoint ID to use.")
@@ -64,6 +84,12 @@ class RunPod(LLM):
     streaming: bool = False
     """Whether to stream the results."""
     
+    poll_interval: float = 1.0
+    """How frequently to poll for job status in seconds."""
+    
+    max_polling_attempts: int = 120
+    """Maximum number of polling attempts for async jobs."""
+    
     _client: httpx.Client = PrivateAttr()
     _async_client: Optional[httpx.AsyncClient] = PrivateAttr(default=None)
     
@@ -92,14 +118,35 @@ class RunPod(LLM):
         """Initialize the RunPod instance."""
         super().__init__(**kwargs)
         self._client = httpx.Client(timeout=self.timeout or 60.0)
+        # Initialize async client if not already done (e.g., in a subclass)
+        if self._async_client is None:
+            self._async_client = httpx.AsyncClient(timeout=self.timeout or 60.0)
     
     @property
     def _llm_type(self) -> str:
         """Return type of llm."""
         return "runpod"
     
+    @property
+    def _identifying_params(self) -> Dict[str, Any]:
+        """Get the identifying parameters."""
+        return {
+            "endpoint_id": self.endpoint_id,
+            "model_name": self.model_name,
+            "api_base": self.api_base,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "stop": self.stop,
+            "timeout": self.timeout,
+            "streaming": self.streaming,
+            "poll_interval": self.poll_interval,
+            "max_polling_attempts": self.max_polling_attempts,
+        }
+    
     def _get_params(self, stop: Optional[List[str]] = None) -> Dict[str, Any]:
-        """Get the parameters to use for the request."""
+        """Get the parameters to pass to the RunPod input object."""
         params = {}
         
         if self.temperature is not None:
@@ -131,52 +178,89 @@ class RunPod(LLM):
         }
     
     def _process_response(self, response: Dict[str, Any]) -> str:
-        """Process the API response and extract the generated text."""
-        logger.debug(f"Raw response: {response}")
-        
-        # Specific handling for the response format seen in integration tests
-        if isinstance(response.get("output"), list):
-            output_list = response["output"]
+        """Process the RunPod API response and extract the generated text.
+        Handles different potential response structures and statuses.
+        """
+        logger.debug(f"Raw RunPod response: {response}")
+
+        status = response.get("status")
+        if status != "COMPLETED":
+            error_detail = response.get("error", "No error details provided.")
+            logger.error(f"RunPod job failed or did not complete. Status: {status}, Error: {error_detail}")
+            # Consider raising a more specific exception type
+            raise ValueError(f"RunPod job ended with status {status}. Error: {error_detail}")
+
+        output = response.get("output")
+
+        if output is None:
+            logger.warning(f"No 'output' field found in RunPod response: {response}")
+            # Fallback: attempt to return the whole response if no output
+            return str(response)
+
+        # --- Process different output structures --- 
+
+        # 1. Output is a simple string
+        if isinstance(output, str):
+            return output
+
+        # 2. Output is a dictionary
+        if isinstance(output, dict):
+            # Common keys containing the main text output
+            common_keys = ["text", "content", "message", "generated_text", "response"]
+            for key in common_keys:
+                if isinstance(output.get(key), str):
+                    return output[key]
             
-            # If the output is a list with a format like [{"choices": [{"tokens": [...]}]}]
-            if output_list and isinstance(output_list[0], dict) and "choices" in output_list[0]:
-                first_item = output_list[0]
-                choices = first_item.get("choices", [])
-                
-                if choices and isinstance(choices[0], dict) and "tokens" in choices[0]:
-                    tokens = choices[0]["tokens"]
-                    # Handle both cases: tokens as a list or as a single string
+            # Handle nested structure like {'choices': [{'text': '...', ...}]} or similar
+            if isinstance(output.get("choices"), list) and output["choices"]:
+                first_choice = output["choices"][0]
+                if isinstance(first_choice, dict):
+                    for key in ["text", "message", "content"]:
+                        if isinstance(first_choice.get(key), str):
+                             return first_choice[key]
+                        # Deeper nesting like message: {content: '...'} 
+                        if isinstance(first_choice.get(key), dict) and isinstance(first_choice[key].get("content"), str):
+                            return first_choice[key]["content"]
+            
+            # Handle Mistral specific output format
+            if "outputs" in output and isinstance(output["outputs"], list) and output["outputs"]:
+                first_output = output["outputs"][0]
+                if isinstance(first_output, dict) and isinstance(first_output.get("text"), str):
+                     return first_output["text"]
+                     
+            # Handle specific format from integration tests: {'choices': [{'tokens': ['...', '...']}]}
+            if isinstance(output.get("choices"), list) and output["choices"]:
+                first_choice = output["choices"][0]
+                if isinstance(first_choice, dict) and isinstance(first_choice.get("tokens"), list):
+                    return "".join(map(str, first_choice["tokens"]))
+
+            # Fallback for unrecognized dictionary structure
+            logger.warning(f"Unrecognized dictionary structure in 'output': {output}")
+            return str(output)
+
+        # 3. Output is a list
+        if isinstance(output, list):
+             # Specific case from integration tests: [{'choices': [{'tokens': [...]}]}]
+            if output and isinstance(output[0], dict) and isinstance(output[0].get("choices"), list):
+                first_item_choices = output[0]["choices"]
+                if first_item_choices and isinstance(first_item_choices[0], dict):
+                    tokens = first_item_choices[0].get("tokens")
                     if isinstance(tokens, list):
-                        # Integration test expects this to be joined into a string
-                        return "".join(tokens)
-                    return str(tokens)
+                        return "".join(map(str, tokens))
+                    elif isinstance(tokens, str): # Handle if 'tokens' is just a string
+                         return tokens
+                         
+            # If it's a list of strings, join them
+            if all(isinstance(item, str) for item in output):
+                return "".join(output)
             
-            # If it's a simple list of strings
-            if all(isinstance(item, str) for item in output_list):
-                return "".join(output_list)
-                
-            # Fallback for any other list format - convert to string
-            return str(output_list)
-        
-        # Handle the case where "output" is directly a string
-        if isinstance(response.get("output"), str):
-            return response["output"]
-            
-        # Handle the case where "output" is a dict
-        if isinstance(response.get("output"), dict):
-            output_dict = response["output"]
-            for key in ["text", "content", "message", "generated_text", "response"]:
-                if key in output_dict and isinstance(output_dict[key], str):
-                    return output_dict[key]
-            
-            # If no recognizable field, return as string
-            return str(output_dict)
-        
-        # Ultimate fallback: return the entire response as a string if we can't extract text
-        logger.warning(f"Unrecognized response format: {response}")
-        if "output" in response:
-            return str(response["output"])
-        return str(response)
+            # Fallback for unrecognized list structure
+            logger.warning(f"Unrecognized list structure in 'output': {output}")
+            return str(output) # Convert the list to string as a fallback
+
+        # --- Ultimate Fallback --- 
+        logger.warning(f"Unrecognized type for 'output' field: {type(output)}. Response: {response}")
+        return str(output) # Return string representation if type is unexpected
     
     def _call(
         self,
@@ -185,7 +269,20 @@ class RunPod(LLM):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> str:
-        """Call the RunPod API and return the generated text."""
+        """Call the RunPod API synchronously and return the generated text.
+
+        Args:
+            prompt: The prompt to send to the model.
+            stop: Optional list of strings to stop generation when encountered.
+            run_manager: Optional callback manager for the run.
+            **kwargs: Additional parameters to pass to the RunPod input object.
+
+        Returns:
+            The generated text from the model.
+
+        Raises:
+            RunPodAPIError: If the API request fails or the job status indicates an error.
+        """
         # Prepare request payload
         payload = {
             "input": {
@@ -217,12 +314,40 @@ class RunPod(LLM):
             
             # Parse and process the response
             response_json = response.json()
+
+            # --- Handle Async Job Polling --- 
+            job_id = response_json.get("id")
+            status = response_json.get("status")
+
+            if job_id and status in ["IN_QUEUE", "IN_PROGRESS"]:
+                logger.info(f"RunPod job {job_id} is async, polling for results...")
+                if run_manager:
+                    # Use on_llm_new_token to provide feedback during polling
+                    run_manager.on_llm_new_token(f"\n[RunPod job {job_id} status: {status}]", verbose=True)
+                response_json = self._poll_for_job_status(job_id, run_manager)
+            # --- End Polling Handling ---
+
             return self._process_response(response_json)
             
-        except httpx.HTTPError as e:
-            raise ValueError(f"HTTP error during RunPod API request: {e}")
+        except httpx.TimeoutException as e:
+            raise RunPodAPIError(f"RunPod API request timed out: {e}") from e
+        except httpx.HTTPStatusError as e:
+            # Log the response body if available for debugging
+            error_body = e.response.text
+            logger.error(f"RunPod API returned an error: {e.response.status_code} - {error_body}")
+            raise RunPodAPIError(
+                f"RunPod API request failed with status {e.response.status_code}: {error_body}"
+            ) from e
+        except httpx.RequestError as e:
+            raise RunPodAPIError(f"Error during RunPod API request: {e}") from e
+        except json.JSONDecodeError as e:
+            # Handle cases where the response is not valid JSON
+            logger.error(f"Failed to decode JSON response from RunPod: {response.text if response else 'No response'}")
+            raise RunPodAPIError(f"Invalid JSON response from RunPod API: {e}") from e
         except Exception as e:
-            raise ValueError(f"Error calling RunPod API: {e}")
+            # Catch-all for unexpected errors during processing
+            logger.exception(f"An unexpected error occurred processing RunPod response: {e}")
+            raise RunPodAPIError(f"Unexpected error processing RunPod response: {e}") from e
     
     def _stream(
         self,
@@ -231,7 +356,23 @@ class RunPod(LLM):
         run_manager: Optional[CallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> Iterator[GenerationChunk]:
-        """Stream the output of the model."""
+        """Stream the output of the model.
+        
+        Note: This currently simulates streaming by first getting the full response
+        synchronously and then yielding chunks.
+
+        Args:
+            prompt: The prompt to send to the model.
+            stop: Optional list of strings to stop generation when encountered.
+            run_manager: Optional callback manager for the run.
+            **kwargs: Additional parameters to pass to the RunPod input object.
+
+        Yields:
+            GenerationChunk: Chunks of the generated text.
+
+        Raises:
+            RunPodAPIError: If the initial API request fails.
+        """
         # For simplicity, we'll implement a basic simulated streaming
         # In a real implementation, you'd connect to RunPod's streaming endpoint
         
@@ -245,3 +386,235 @@ class RunPod(LLM):
                 run_manager.on_llm_new_token(char)
                 
             yield chunk 
+
+    async def _acall(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> str:
+        """Asynchronously call the RunPod API and return the generated text.
+
+        Args:
+            prompt: The prompt to send to the model.
+            stop: Optional list of strings to stop generation when encountered.
+            run_manager: Optional callback manager for the run.
+            **kwargs: Additional parameters to pass to the RunPod input object.
+
+        Returns:
+            The generated text from the model.
+
+        Raises:
+            RunPodAPIError: If the API request fails or the job status indicates an error.
+        """
+        # Prepare request payload
+        payload = {
+            "input": {
+                "prompt": prompt,
+                **self._get_params(stop),
+            }
+        }
+
+        # Add any additional kwargs to the payload
+        for key, value in kwargs.items():
+            if key not in payload["input"]:
+                payload["input"][key] = value
+
+        # API request
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            url = f"{self.api_base}/{self.endpoint_id}/run"
+            if self._async_client is None:
+                # Should ideally be initialized in __init__
+                self._async_client = httpx.AsyncClient(timeout=self.timeout or 60.0)
+
+            response = await self._async_client.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=self.timeout or 60.0,
+            )
+            response.raise_for_status()
+
+            # Parse and process the response
+            response_json = response.json()
+
+            # --- Handle Async Job Polling --- 
+            job_id = response_json.get("id")
+            status = response_json.get("status")
+
+            if job_id and status in ["IN_QUEUE", "IN_PROGRESS"]:
+                logger.info(f"RunPod job {job_id} is async, polling for results...")
+                if run_manager:
+                    await run_manager.on_llm_new_token(f"\n[RunPod job {job_id} status: {status}]", verbose=True)
+                response_json = await self._apoll_for_job_status(job_id, run_manager)
+            # --- End Polling Handling ---
+
+            return self._process_response(response_json)
+
+        except httpx.TimeoutException as e:
+            raise RunPodAPIError(f"RunPod API async request timed out: {e}") from e
+        except httpx.HTTPStatusError as e:
+            error_body = e.response.text
+            logger.error(f"RunPod API (async) returned an error: {e.response.status_code} - {error_body}")
+            raise RunPodAPIError(
+                f"RunPod API async request failed with status {e.response.status_code}: {error_body}"
+            ) from e
+        except httpx.RequestError as e:
+             raise RunPodAPIError(f"Error during RunPod API async request: {e}") from e
+        except json.JSONDecodeError as e:
+             logger.error(f"Failed to decode JSON async response from RunPod: {response.text if response else 'No response'}")
+             raise RunPodAPIError(f"Invalid JSON response from RunPod API (async): {e}") from e
+        except Exception as e:
+             logger.exception(f"An unexpected error occurred processing async RunPod response: {e}")
+             raise RunPodAPIError(f"Unexpected error processing async RunPod response: {e}") from e
+
+    async def _astream(
+        self,
+        prompt: str,
+        stop: Optional[List[str]] = None,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[GenerationChunk]:
+        """Stream the output of the model asynchronously.
+
+        Note: This currently simulates streaming by first getting the full response
+        asynchronously and then yielding chunks.
+
+        Args:
+            prompt: The prompt to send to the model.
+            stop: Optional list of strings to stop generation when encountered.
+            run_manager: Optional callback manager for the run.
+            **kwargs: Additional parameters to pass to the RunPod input object.
+
+        Yields:
+            GenerationChunk: Chunks of the generated text.
+        
+        Raises:
+            RunPodAPIError: If the initial API request fails.
+        """
+        # Simulate streaming by getting the full response first
+        full_response = await self._acall(prompt, stop, run_manager, **kwargs)
+
+        # Yield the response chunk by chunk (character by character)
+        for char in full_response:
+            chunk = GenerationChunk(text=char)
+            if run_manager:
+                await run_manager.on_llm_new_token(token=chunk.text, chunk=chunk)
+            yield chunk 
+
+    def _poll_for_job_status(
+        self,
+        job_id: str,
+        run_manager: Optional[CallbackManagerForLLMRun] = None,
+    ) -> Dict[str, Any]:
+        """Poll the RunPod /status endpoint until the job is completed or fails."""
+        status_url = f"{self.api_base}/{self.endpoint_id}/status/{job_id}"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        
+        for attempt in range(self.max_polling_attempts):
+            try:
+                status_response = self._client.get(
+                    status_url,
+                    headers=headers,
+                    timeout=self.timeout or 60.0, 
+                )
+                status_response.raise_for_status()
+                status_data = status_response.json()
+                status = status_data.get("status")
+
+                logger.debug(f"Poll attempt {attempt+1}: Job {job_id} status: {status}")
+                if run_manager:
+                     # Use on_llm_new_token to provide feedback during polling
+                    run_manager.on_llm_new_token(f"\n[RunPod job {job_id} status: {status}]", verbose=True)
+
+                if status == "COMPLETED":
+                    return status_data
+                elif status == "FAILED":
+                     error_detail = status_data.get("error", "Job failed with no error details.")
+                     logger.error(f"RunPod job {job_id} failed: {error_detail}")
+                     # Return the failed status data for _process_response to handle
+                     return status_data 
+                elif status in ["IN_QUEUE", "IN_PROGRESS"]:
+                    time.sleep(self.poll_interval)
+                else:
+                    # Unexpected status
+                    logger.warning(f"RunPod job {job_id} returned unexpected status: {status}")
+                    return status_data # Return what we have
+
+            except httpx.HTTPStatusError as e:
+                # Log polling error but continue polling unless it's critical (like 401/404)
+                logger.error(f"HTTP error while polling job {job_id} (attempt {attempt+1}): {e}")
+                if e.response.status_code in [401, 403, 404]:
+                     raise RunPodAPIError(f"Fatal HTTP error {e.response.status_code} while polling job {job_id}") from e
+                time.sleep(self.poll_interval)
+            except httpx.RequestError as e:
+                 logger.error(f"Request error while polling job {job_id} (attempt {attempt+1}): {e}")
+                 time.sleep(self.poll_interval)
+            except Exception as e:
+                 logger.exception(f"Unexpected error while polling job {job_id} (attempt {attempt+1}): {e}")
+                 time.sleep(self.poll_interval)
+                 
+        raise TimeoutError(
+            f"RunPod job {job_id} did not complete after {self.max_polling_attempts} attempts."
+        ) 
+
+    async def _apoll_for_job_status(
+        self,
+        job_id: str,
+        run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
+    ) -> Dict[str, Any]:
+        """Poll the RunPod /status endpoint asynchronously until the job is completed or fails."""
+        status_url = f"{self.api_base}/{self.endpoint_id}/status/{job_id}"
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        
+        if self._async_client is None:
+             self._async_client = httpx.AsyncClient(timeout=self.timeout or 60.0)
+
+        for attempt in range(self.max_polling_attempts):
+            try:
+                status_response = await self._async_client.get(
+                    status_url,
+                    headers=headers,
+                    timeout=self.timeout or 60.0,
+                )
+                status_response.raise_for_status()
+                status_data = status_response.json()
+                status = status_data.get("status")
+
+                logger.debug(f"Async poll attempt {attempt+1}: Job {job_id} status: {status}")
+                if run_manager:
+                     await run_manager.on_llm_new_token(f"\n[RunPod job {job_id} status: {status}]", verbose=True)
+
+                if status == "COMPLETED":
+                    return status_data
+                elif status == "FAILED":
+                    error_detail = status_data.get("error", "Job failed with no error details.")
+                    logger.error(f"RunPod job {job_id} failed: {error_detail}")
+                    return status_data
+                elif status in ["IN_QUEUE", "IN_PROGRESS"]:
+                    await asyncio.sleep(self.poll_interval)
+                else:
+                    logger.warning(f"RunPod job {job_id} returned unexpected status: {status}")
+                    return status_data
+
+            except httpx.HTTPStatusError as e:
+                logger.error(f"HTTP error while polling job {job_id} (async attempt {attempt+1}): {e}")
+                if e.response.status_code in [401, 403, 404]:
+                    raise RunPodAPIError(f"Fatal HTTP error {e.response.status_code} while polling job {job_id} (async)") from e
+                await asyncio.sleep(self.poll_interval)
+            except httpx.RequestError as e:
+                 logger.error(f"Request error while polling job {job_id} (async attempt {attempt+1}): {e}")
+                 await asyncio.sleep(self.poll_interval)
+            except Exception as e:
+                 logger.exception(f"Unexpected error while polling job {job_id} (async attempt {attempt+1}): {e}")
+                 await asyncio.sleep(self.poll_interval)
+
+        raise TimeoutError(
+            f"RunPod job {job_id} did not complete after {self.max_polling_attempts} async attempts."
+        ) 

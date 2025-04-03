@@ -138,3 +138,8 @@ The level of support for advanced LLM features depends heavily on the **specific
 5. Once active, copy the **Endpoint ID** for use with this library.
 
 For more details, refer to the [RunPod Serverless Documentation](https://docs.runpod.io/serverless/overview).
+
+## Future Enhancements
+
+- **Native Streaming via RunPod SDK:** While the current implementation simulates streaming, future versions could potentially integrate the official [`runpod` Python SDK](https://docs.runpod.io/sdks/python/endpoints/#streaming). This would enable true, low-latency token streaming *if* the target RunPod endpoint handler is configured with `"return_aggregate_stream": True`.
+- **Standardized Feature Handling:** Explore ways to better handle or document patterns for features like Tool Calling or JSON Mode if common conventions emerge for RunPod endpoint handlers.
